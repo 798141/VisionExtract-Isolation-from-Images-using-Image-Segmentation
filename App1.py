@@ -1,4 +1,4 @@
-
+-------------------------------Frontennd------------------------------------------------
 
 import io
 from pathlib import Path
@@ -101,3 +101,81 @@ if uploaded:
         buf.seek(0)
         st.download_button("Download Result", buf, "masked_output.png", "image/png")
 st.markdown("</div>", unsafe_allow_html=True)
+
+
+
+---------------------------------Backend--------------------------------------------
+
+
+import numpy as np
+import cv2
+from PIL import Image
+import torch
+from torchvision import transforms
+from torchvision.models import segmentation
+
+# ----------------- Config -----------------
+FG_THRESHOLD = 0.6
+MORPH_KERNEL = 7
+MORPH_ITER = 3
+KEEP_LARGEST = True
+
+# ----------------- Model loader -----------------
+@torch.no_grad()
+def load_model(device="cpu"):
+    model = segmentation.deeplabv3_resnet50(pretrained=True, progress=False)
+    model.eval()
+    model.to(device)
+    return model
+
+# ----------------- Preprocessing -----------------
+preprocess = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406],
+                         std=[0.229,0.224,0.225])
+])
+
+def image_to_tensor(img_pil: Image.Image, device="cpu"):
+    return preprocess(img_pil).unsqueeze(0).to(device)
+
+# ----------------- Mask Helpers -----------------
+def keep_largest_component(mask_np):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, 8)
+    if num_labels <= 1:
+        return mask_np
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_label = 1 + int(np.argmax(areas))
+    return (labels == largest_label).astype("uint8") * 255
+
+def refine_mask(prob_map):
+    bin_mask = (prob_map >= FG_THRESHOLD).astype("uint8") * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MORPH_KERNEL,MORPH_KERNEL))
+    cleaned = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITER)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=MORPH_ITER)
+    if KEEP_LARGEST:
+        cleaned = keep_largest_component(cleaned)
+    return cleaned
+
+def sharpen_image(img):
+    blur = cv2.GaussianBlur(img, (0,0), 3)
+    sharp = cv2.addWeighted(img, 1.7, blur, -0.7, 0)
+    return np.clip(sharp, 0, 255).astype("uint8")
+
+# ----------------- Core Segmentation -----------------
+def segment_object_only(img_pil: Image.Image, model, device="cpu", bg_color=(0,0,0)):
+    tensor = image_to_tensor(img_pil, device)
+    out = model(tensor)
+    logits = out['out'][0]
+    probs = torch.softmax(logits, dim=0).cpu().numpy()
+
+    fg_prob = np.max(probs[1:], axis=0)
+    img_w, img_h = img_pil.size
+    fg_prob_resized = cv2.resize(fg_prob, (img_w,img_h), cv2.INTER_NEAREST)
+    bin_mask = refine_mask(fg_prob_resized)
+
+    src = np.array(img_pil).astype("float32")/255.0
+    bg = np.ones_like(src) * (np.array(bg_color)/255.0)
+    alpha = (bin_mask/255)[:, :, None]
+    out_rgb = src*alpha + bg*(1-alpha)
+
+    return Image.fromarray(sharpen_image(out_rgb))
