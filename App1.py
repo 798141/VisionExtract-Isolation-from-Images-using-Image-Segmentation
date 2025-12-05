@@ -1,4 +1,4 @@
--------------------------------Frontennd------------------------------------------------
+
 
 import io
 from pathlib import Path
@@ -104,7 +104,7 @@ st.markdown("</div>", unsafe_allow_html=True)
 
 
 
----------------------------------Backend--------------------------------------------
+
 
 
 import numpy as np
