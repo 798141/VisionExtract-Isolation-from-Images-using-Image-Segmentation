@@ -1,69 +1,73 @@
-from flask import Flask, render_template, request, redirect, url_for
-from werkzeug.utils import secure_filename
-import os
-from PIL import Image
+
 import numpy as np
+import cv2
+from PIL import Image
+import torch
+from torchvision import transforms
+from torchvision.models import segmentation
 
-app = Flask(__name__)
+# ----------------- Config -----------------
+FG_THRESHOLD = 0.6
+MORPH_KERNEL = 7
+MORPH_ITER = 3
+KEEP_LARGEST = True
 
-# Configure upload folders
-UPLOAD_FOLDER = "static/uploads"
-RESULT_FOLDER = "static/results"
-os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(RESULT_FOLDER, exist_ok=True)
+# ----------------- Model loader -----------------
+@torch.no_grad()
+def load_model(device="cpu"):
+    model = segmentation.deeplabv3_resnet50(pretrained=True, progress=False)
+    model.eval()
+    model.to(device)
+    return model
 
-app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
-app.config["RESULT_FOLDER"] = RESULT_FOLDER
+# ----------------- Preprocessing -----------------
+preprocess = transforms.Compose([
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485,0.456,0.406],
+                         std=[0.229,0.224,0.225])
+])
 
-ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg"}
+def image_to_tensor(img_pil: Image.Image, device="cpu"):
+    return preprocess(img_pil).unsqueeze(0).to(device)
 
-# TODO: load your trained segmentation model here
-# model = load_your_model(...)
+# ----------------- Mask Helpers -----------------
+def keep_largest_component(mask_np):
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, 8)
+    if num_labels <= 1:
+        return mask_np
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    largest_label = 1 + int(np.argmax(areas))
+    return (labels == largest_label).astype("uint8") * 255
 
-def allowed_file(filename):
-    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+def refine_mask(prob_map):
+    bin_mask = (prob_map >= FG_THRESHOLD).astype("uint8") * 255
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (MORPH_KERNEL,MORPH_KERNEL))
+    cleaned = cv2.morphologyEx(bin_mask, cv2.MORPH_CLOSE, kernel, iterations=MORPH_ITER)
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel, iterations=MORPH_ITER)
+    if KEEP_LARGEST:
+        cleaned = keep_largest_component(cleaned)
+    return cleaned
 
-def run_segmentation_model(image_path):
-    """
-    Dummy placeholder for your segmentation.
-    Replace this with actual model inference that returns an RGBA or RGB image
-    where background is black and subject is preserved.
-    """
-    img = Image.open(image_path).convert("RGB")
-    # Example: here just return original image (no segmentation) for now
-    return img
+def sharpen_image(img):
+    blur = cv2.GaussianBlur(img, (0,0), 3)
+    sharp = cv2.addWeighted(img, 1.7, blur, -0.7, 0)
+    return np.clip(sharp, 0, 255).astype("uint8")
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    if request.method == "POST":
-        if "image" not in request.files:
-            return redirect(request.url)
+# ----------------- Core Segmentation -----------------
+def segment_object_only(img_pil: Image.Image, model, device="cpu", bg_color=(0,0,0)):
+    tensor = image_to_tensor(img_pil, device)
+    out = model(tensor)
+    logits = out['out'][0]
+    probs = torch.softmax(logits, dim=0).cpu().numpy()
 
-        file = request.files["image"]
-        if file.filename == "":
-            return redirect(request.url)
+    fg_prob = np.max(probs[1:], axis=0)
+    img_w, img_h = img_pil.size
+    fg_prob_resized = cv2.resize(fg_prob, (img_w,img_h), cv2.INTER_NEAREST)
+    bin_mask = refine_mask(fg_prob_resized)
 
-        if file and allowed_file(file.filename):
-            filename = secure_filename(file.filename)
-            input_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
-            file.save(input_path)
+    src = np.array(img_pil).astype("float32")/255.0
+    bg = np.ones_like(src) * (np.array(bg_color)/255.0)
+    alpha = (bin_mask/255)[:, :, None]
+    out_rgb = src*alpha + bg*(1-alpha)
 
-            # Run segmentation model
-            output_img = run_segmentation_model(input_path)
-
-            # Save result
-            result_name = "segmented_" + filename
-            result_path = os.path.join(app.config["RESULT_FOLDER"], result_name)
-            output_img.save(result_path)
-
-            return render_template(
-                "index.html",
-                input_image=url_for("static", filename=f"uploads/{filename}"),
-                result_image=url_for("static", filename=f"results/{result_name}")
-            )
-
-    return render_template("index.html", input_image=None, result_image=None)
-
-
-if __name__ == "__main__":
-    app.run(debug=True)
+    return Image.fromarray(sharpen_image(out_rgb))
